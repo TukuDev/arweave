@@ -53,7 +53,7 @@ init(WalletList, StartingDiff, RewardPool) ->
 			nonce = crypto:strong_rand_bytes(32),
 			txs = TXs,
 			wallet_list = WalletList,
-			block_index = [],
+			hash_list = [],
 			diff = StartingDiff,
 			weave_size = 0,
 			block_size = 0,
