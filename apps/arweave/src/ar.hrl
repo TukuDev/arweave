@@ -147,7 +147,7 @@
 -define(REJOIN_TIMEOUT, 3 * 1000).
 
 %% @doc Time between attempts to find optimise peers.
--define(GET_MORE_PEERS_TIME,  240 * 1000).
+-define(GET_MORE_PEERS_TIME,  240 * 1000 * 10).
 
 %% @doc Number of transfers for which not to score (and potentially drop)
 %% new peers.
