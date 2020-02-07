@@ -72,7 +72,7 @@ mine(Diff, Algorithm) ->
 	},
 	ar_mine:start(B, B, [], unclaimed, [], Diff, self(), []),
 	receive
-		{work_complete, _, _, _, _, _, _, _, HashesTried} ->
+		{work_complete, _, _, _, _, _, HashesTried} ->
 			HashesTried
 	end.
 

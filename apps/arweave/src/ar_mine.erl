@@ -1,9 +1,12 @@
 -module(ar_mine).
--export([start/7, start/8, stop/1, mine/2]).
+
+-export([start/8, stop/1, mine/2]).
 -export([validate/4, validate/3]).
 -export([min_difficulty/1, genesis_difficulty/0, max_difficulty/0]).
 -export([sha384_diff_to_randomx_diff/1]).
+
 -include("ar.hrl").
+
 -include_lib("eunit/include/eunit.hrl").
 
 %%% A module for managing mining of blocks on the weave,
@@ -12,40 +15,54 @@
 -record(state, {
 	parent, % miners parent process (initiator)
 	current_block, % current block held by node
+	candidate_block = not_set, % the product of mining
 	block_txs_pairs, % list of {BH, TXIDs} pairs for latest ?MAX_TX_ANCHOR_DEPTH blocks
-	poa, % recall block related to current
+	poa, % proof of access
 	txs, % the set of txs to be mined
 	timestamp, % the block timestamp used for the mining
-	timestamp_refresh_timer, % Reference for timer for updating the timestamp
+	timestamp_refresh_timer, % reference for timer for updating the timestamp
 	data_segment = <<>>, % the data segment generated for mining
-	data_segment_duration, % duration in seconds of the last generation of the data segment.
-	reward_addr, % the nodes reward address
-	tags, % the nodes block tags
+	data_segment_duration, % duration in seconds of the last generation of the data segment
+	reward_addr, % the mining reward address
+	reward_wallet = not_set, % the mining reward wallet
+	tags, % the block tags
 	diff, % the current network difficulty
-	auto_update_diff, % should the diff be kept or updated automatically
 	delay = 0, % hashing delay used for testing
-	max_miners = ?NUM_MINING_PROCESSES, % max mining process to start (ar.hrl)
+	max_miners = ?NUM_MINING_PROCESSES, % max mining process to start
 	miners = [], % miner worker processes
-	bds_pieces = not_generated, % a list of binary components of block data segment, stored for quick updates
-	total_hashes_tried = 0,
-	started_at = not_set
+	bds_base = not_generated, % part of the block data segment not changed during mining
+	total_hashes_tried = 0, % the number of tried hashes, used to estimate the hashrate
+	started_at = not_set % the timestamp when the mining begins, used to estimate the hashrate
 }).
 
 %% @doc Spawns a new mining process and returns its PID.
-start(CurrentB, POA, RawTXs, RewardAddr, Tags, Parent, BlockTXPairs) ->
-	do_start(CurrentB, POA, RawTXs, RewardAddr, Tags, auto_update, Parent, BlockTXPairs).
-
-start(CurrentB, POA, RawTXs, RewardAddr, Tags, StaticDiff, Parent, BlockTXPairs) when is_integer(StaticDiff) ->
-	do_start(CurrentB, POA, RawTXs, RewardAddr, Tags, StaticDiff, Parent, BlockTXPairs).
-
-do_start(CurrentB, POA, RawTXs, unclaimed, Tags, Diff, Parent, BlockTXPairs) ->
-	do_start(CurrentB, POA, RawTXs, <<>>, Tags, Diff, Parent, BlockTXPairs);
-do_start(CurrentB, POA, RawTXs, RewardAddr, Tags, Diff, Parent, BlockTXPairs) ->
-	%ar:d([{mining_txs, RawTXs}]),
-	{NewDiff, AutoUpdateDiff} = case Diff of
-		auto_update -> {not_set, true};
-		_ -> {Diff, false}
+start(CurrentB, POA, RawTXs, RewardAddr, Tags, Parent, BlockTXPairs, BI) ->
+	Fork_2_0 = ar_fork:height_2_0() ,
+	CurrentHeight = CurrentB#block.height,
+	NewVotables = case CurrentHeight + 1 of
+		Fork_2_0 ->
+			ar_votable:init();
+		H when H > Fork_2_0 ->
+			ar_votable:vote(CurrentB#block.votables);
+		_ ->
+			[]
 	end,
+	BlockPOA = case CurrentHeight + 1 >= Fork_2_0 of
+		true ->
+			POA;
+		false ->
+			undefined
+	end,
+	CandidateB = #block{
+		height = CurrentB#block.height + 1,
+		hash_list = ?BI_TO_BHL(BI),
+		previous_block = CurrentB#block.indep_hash,
+		hash_list_merkle = ar_block:compute_hash_list_merkle(CurrentB, BI),
+		reward_addr = RewardAddr,
+		poa = BlockPOA,
+		votables = NewVotables,
+		tags = Tags
+	},
 	start_server(
 		#state {
 			parent = Parent,
@@ -55,10 +72,9 @@ do_start(CurrentB, POA, RawTXs, RewardAddr, Tags, Diff, Parent, BlockTXPairs) ->
 			reward_addr = RewardAddr,
 			tags = Tags,
 			max_miners = ar_meta_db:get(max_miners),
-			diff = NewDiff,
-			auto_update_diff = AutoUpdateDiff,
 			block_txs_pairs = BlockTXPairs,
-			started_at = erlang:timestamp()
+			started_at = erlang:timestamp(),
+			candidate_block = CandidateB
 		},
 		RawTXs
 	).
@@ -144,18 +160,15 @@ sha384_diff_to_randomx_diff(Sha384Diff) ->
 update_txs(
 	S = #state {
 		current_block = CurrentB,
-		diff = CurrentDiff,
 		data_segment_duration = BDSGenerationDuration,
-		auto_update_diff = AutoUpdateDiff,
-		block_txs_pairs = BlockTXPairs
+		block_txs_pairs = BlockTXPairs,
+		reward_addr = RewardAddr,
+		candidate_block = CandidateB
 	},
 	TXs
 ) ->
 	NextBlockTimestamp = next_block_timestamp(BDSGenerationDuration),
-	NextDiff = case AutoUpdateDiff of
-		true -> calc_diff(CurrentB, NextBlockTimestamp);
-		false -> CurrentDiff
-	end,
+	NextDiff = calc_diff(CurrentB, NextBlockTimestamp),
 	ValidTXs = ar_tx_replay_pool:pick_txs_to_mine(
 		BlockTXPairs,
 		CurrentB#block.height,
@@ -164,7 +177,57 @@ update_txs(
 		CurrentB#block.wallet_list,
 		TXs
 	),
-	update_data_segment(S, ValidTXs, NextBlockTimestamp, NextDiff).
+	NewBlockSize =
+		lists:foldl(
+			fun(TX, Acc) ->
+				Acc + byte_size(TX#tx.data)
+			end,
+			0,
+			ValidTXs
+		),
+	NewWeaveSize = CurrentB#block.weave_size + NewBlockSize,
+	{FinderReward, _RewardPool} =
+		ar_node_utils:calculate_reward_pool(
+			CurrentB#block.reward_pool,
+			ValidTXs,
+			RewardAddr,
+			CandidateB#block.poa,
+			NewWeaveSize,
+			CandidateB#block.height,
+			NextDiff,
+			NextBlockTimestamp
+		),
+	NewWalletList =
+		ar_node_utils:apply_mining_reward(
+			ar_node_utils:apply_txs(CurrentB#block.wallet_list, ValidTXs, CurrentB#block.height),
+			RewardAddr,
+			FinderReward,
+			CandidateB#block.height
+		),
+	Fork_2_0 = ar_fork:height_2_0(),
+	NewCandidateB = CandidateB#block{
+		txs = [TX#tx.id || TX <- ValidTXs],
+		tx_root = ar_block:generate_tx_root_for_block(ValidTXs),
+		block_size = NewBlockSize,
+		weave_size = NewWeaveSize,
+		wallet_list = NewWalletList
+	},
+	{BDSBase, RewardWallet} = case CurrentB#block.height + 1 < Fork_2_0 of
+		true ->
+			{not_generated, not_set};
+		false ->
+			ar_block:generate_block_data_segment_base(NewCandidateB)
+	end,
+	update_data_segment(
+		S#state{
+			candidate_block = NewCandidateB,
+			bds_base = BDSBase,
+			reward_wallet = RewardWallet
+		},
+		ValidTXs,
+		NextBlockTimestamp,
+		NextDiff
+	).
 
 %% @doc Generate a new timestamp to be used in the next block. To compensate for
 %% the time it takes to generate the block data segment, adjust the timestamp
@@ -191,41 +254,50 @@ update_data_segment(S = #state { txs = TXs }) ->
 update_data_segment(
 	S = #state {
 		data_segment_duration = BDSGenerationDuration,
-		auto_update_diff = AutoUpdateDiff,
-		diff = CurrentDiff,
 		current_block = CurrentB
 	},
 	TXs
 ) ->
 	BlockTimestamp = next_block_timestamp(BDSGenerationDuration),
-	Diff = case AutoUpdateDiff of
-		true -> calc_diff(CurrentB, BlockTimestamp);
-		false -> CurrentDiff
-	end,
+	Diff = calc_diff(CurrentB, BlockTimestamp),
 	update_data_segment(S, TXs, BlockTimestamp, Diff).
 
 update_data_segment(S, TXs, BlockTimestamp, Diff) ->
-	{DurationMicros, {NewBDSPieces, BDS}} =
-		case S#state.bds_pieces of
+	CandidateB = S#state.candidate_block,
+	case CandidateB#block.height < ar_fork:height_2_0() of
+		true ->
+			update_data_segment_pre_2_0(S, TXs, BlockTimestamp, Diff);
+		false ->
+			update_data_segment_post_2_0(S, TXs, BlockTimestamp, Diff)
+	end.
+
+update_data_segment_pre_2_0(S, TXs, BlockTimestamp, Diff) ->
+	#state{ candidate_block = CandidateBlock } = S,
+	RewardAddr = case S#state.reward_addr of
+		unclaimed -> <<>>;
+		R -> R
+	end,
+	{DurationMicros, {NewBDSBase, BDS}} =
+		case S#state.bds_base of
 			not_generated ->
 				timer:tc(fun() ->
 					ar_block:generate_block_data_segment_and_pieces(
 						S#state.current_block,
 						S#state.poa,
 						TXs,
-						S#state.reward_addr,
+						RewardAddr,
 						BlockTimestamp,
 						S#state.tags
 					)
 				end);
-			BDSPieces ->
+			BDSBase ->
 				timer:tc(fun() ->
 					ar_block:refresh_block_data_segment_timestamp(
-						BDSPieces,
+						BDSBase,
 						S#state.current_block,
 						S#state.poa,
 						TXs,
-						S#state.reward_addr,
+						RewardAddr,
 						BlockTimestamp
 					)
 				end)
@@ -236,7 +308,88 @@ update_data_segment(S, TXs, BlockTimestamp, Diff) ->
 		txs = TXs,
 		data_segment = BDS,
 		data_segment_duration = round(DurationMicros / 1000000),
-		bds_pieces = NewBDSPieces
+		bds_base = NewBDSBase,
+		candidate_block = CandidateBlock#block{
+			timestamp = BlockTimestamp,
+			diff = Diff
+		}
+	},
+	reschedule_timestamp_refresh(NewS).
+
+update_data_segment_post_2_0(S, TXs, BlockTimestamp, Diff) ->
+	#state{
+		current_block = CurrentB,
+		candidate_block = CandidateB,
+		reward_addr = RewardAddr,
+		poa = POA,
+		bds_base = BDSBase,
+		reward_wallet = RewardWallet
+	} = S,
+	NewLastRetarget =
+		case ar_retarget:is_retarget_height(CandidateB#block.height) of
+			true -> BlockTimestamp;
+			false -> CurrentB#block.last_retarget
+		end,
+	{FinderReward, RewardPool} =
+		ar_node_utils:calculate_reward_pool(
+			CurrentB#block.reward_pool,
+			TXs,
+			RewardAddr,
+			POA,
+			CandidateB#block.weave_size,
+			CandidateB#block.height,
+			Diff,
+			BlockTimestamp
+		),
+	WL = case RewardWallet of
+		not_in_the_list ->
+			[];
+		_ ->
+			[RewardWallet]
+	end,
+	NewRewardWallet =
+		case ar_node_utils:apply_mining_reward(WL, RewardAddr, FinderReward, CandidateB#block.height) of
+			[RW] ->
+				RW;
+			[] ->
+				not_in_the_list
+		end,
+	CDiff = ar_difficulty:next_cumulative_diff(
+		CurrentB#block.cumulative_diff,
+		Diff,
+		CandidateB#block.height
+	),
+	{DurationMicros, NewBDS} = timer:tc(
+		fun() ->
+			ar_block:generate_block_data_segment(
+				BDSBase,
+				CandidateB#block.hash_list_merkle,
+				#{
+					timestamp => BlockTimestamp,
+					last_retarget => NewLastRetarget,
+					diff => Diff,
+					cumulative_diff => CDiff,
+					reward_pool => RewardPool,
+					reward_wallet => NewRewardWallet
+				}
+			)
+		end
+	),
+	NewCandidateB = CandidateB#block{
+		timestamp = BlockTimestamp,
+		last_retarget = NewLastRetarget,
+		diff = Diff,
+		cumulative_diff = CDiff,
+		reward_pool = RewardPool
+	},
+	NewS = S#state {
+		timestamp = BlockTimestamp,
+		diff = Diff,
+		data_segment = NewBDS,
+		data_segment_duration = round(DurationMicros / 1000000),
+		txs = TXs,
+		candidate_block = NewCandidateB,
+		reward_wallet = NewRewardWallet
 	},
 	reschedule_timestamp_refresh(NewS).
 
@@ -279,10 +432,14 @@ server(
 	S = #state {
 		parent = Parent,
 		miners = Miners,
-		current_block = #block { indep_hash = CurrentBH },
+		current_block = #block { indep_hash = CurrentBH } = CurrentB,
 		poa = POA,
 		total_hashes_tried = TotalHashesTried,
-		started_at = StartedAt
+		started_at = StartedAt,
+		data_segment = BDS,
+		reward_addr = RewardAddr,
+		reward_wallet = RewardWallet,
+		candidate_block = #block { diff = Diff, timestamp = Timestamp } = CandidateB
 	}
 ) ->
 	receive
@@ -299,18 +456,73 @@ server(
 		%% Count the number of hashes tried by all workers.
 		{hashes_tried, HashesTried} ->
 			server(S#state { total_hashes_tried = TotalHashesTried + HashesTried });
-		% Handle a potential solution for the mining puzzle.
-		% Returns the solution back to the node to verify and ends the process.
-		{solution, Hash, Nonce, MinedTXs, MinedDiff, MinedTimestamp} ->
+		%% Handle a potential solution for the mining puzzle.
+		%% Returns the solution back to the node to verify and ends the process.
+		{solution, Hash, Nonce, MinedTXs, Diff, Timestamp} ->
 			ar:info(
 				[
-					{miner_found_nonce, self()}
-					%{poa, POA}
+					{event, miner_found_nonce},
+					{pid, self()}
 				]
 			),
-			Parent ! {work_complete, CurrentBH, MinedTXs, Hash, POA, MinedDiff, Nonce, MinedTimestamp, TotalHashesTried},
+			Fork_2_0 = ar_fork:height_2_0(),
+			NewBBeforeHash = case CandidateB#block.height >= Fork_2_0 of
+				true ->
+					CandidateB#block{
+						nonce = Nonce,
+						hash = Hash,
+						wallet_list = lists:keyreplace(RewardAddr, 1, CandidateB#block.wallet_list, RewardWallet)
+					};
+				false ->
+					{FinderReward, RewardPool} =
+						ar_node_utils:calculate_reward_pool(
+							CurrentB#block.reward_pool,
+							MinedTXs,
+							RewardAddr,
+							POA,
+							CandidateB#block.weave_size,
+							CandidateB#block.height,
+							CandidateB#block.diff,
+							CandidateB#block.timestamp
+						),
+					NewWalletList = ar_node_utils:apply_mining_reward(
+						ar_node_utils:apply_txs(CurrentB#block.wallet_list, MinedTXs, CurrentB#block.height),
+						RewardAddr,
+						FinderReward,
+						CandidateB#block.height
+					),
+					NewCDiff = ar_difficulty:next_cumulative_diff(
+						CurrentB#block.cumulative_diff,
+						CandidateB#block.diff,
+						CandidateB#block.height
+					),
+					NewLastRetarget = case ar_retarget:is_retarget_height(CurrentB#block.height) of
+						true -> CandidateB#block.timestamp;
+						false -> CurrentB#block.last_retarget
+					end,
+					CandidateB#block{
+						nonce = Nonce,
+						hash = Hash,
+						cumulative_diff = NewCDiff,
+						last_retarget = NewLastRetarget,
+						wallet_list = NewWalletList,
+						reward_pool = RewardPool
+					}
+			end,
+			IndepHash =
+				case CandidateB#block.height >= Fork_2_0 of
+					true ->
+						ar_weave:indep_hash_post_fork_2_0(BDS, Hash, Nonce);
+					false ->
+						ar_weave:indep_hash(NewBBeforeHash)
+				end,
+			NewB = NewBBeforeHash#block{ indep_hash = IndepHash },
+			Parent ! {work_complete, CurrentBH, NewB, MinedTXs, BDS, POA, TotalHashesTried},
 			log_performance(TotalHashesTried, StartedAt),
-			stop_miners(Miners)
+			stop_miners(Miners);
+		{solution, _, _, _, _, _} ->
+			%% A stale solution.
+			server(S)
 	end.
 
 log_performance(TotalHashesTried, StartedAt) ->
@@ -405,8 +617,6 @@ find_nonce(BDS, Diff, Height, Nonce, Hasher, Supervisor) ->
 
 -ifdef(DEBUG).
 min_randomx_difficulty() -> 1.
-min_sha384_difficulty() -> 8.
-randomx_genesis_difficulty() -> min_randomx_difficulty().
 -else.
 min_randomx_difficulty() -> min_sha384_difficulty() + ?RANDOMX_DIFF_ADJUSTMENT.
 min_sha384_difficulty() -> 31.
@@ -424,7 +634,7 @@ basic_test_() ->
 			[B0] = ar_weave:init([]),
 			ar_node:start([], [B0]),
 			[B1 | _] = ar_weave:add([B0], []),
-			start(B1, B1#block.poa, [], unclaimed, [], self(), []),
+			start(B1, B1#block.poa, [], unclaimed, [], self(), [], [{B0#block.indep_hash, 0}]),
 			assert_mine_output(B1, B1#block.poa, [])
 		end
 	).
@@ -434,7 +644,7 @@ basic_pre_fork_2_0_test() ->
 	ar_node:start([], [B0]),
 	[B1 | _] = ar_weave:add([B0], []),
 	RecallB = B0,
-	start(B1, RecallB, [], unclaimed, [], self(), []),
+	start(B1, RecallB, [], unclaimed, [], self(), [], [{B0#block.indep_hash, 0}]),
 	assert_mine_output(B1, RecallB, []).
 
 %% @doc Ensure that the block timestamp gets updated regularly while mining.
@@ -483,7 +693,7 @@ miner_start_stop_test() ->
 
 assert_mine_output(B, POA, TXs) ->
 	receive
-		{work_complete, BH, MinedTXs, Hash, POA, MinedDiff, Nonce, Timestamp, _} ->
+		{work_complete, BH, NewB, MinedTXs, POA, _} ->
 			?assertEqual(BH, B#block.indep_hash),
 			?assertEqual(lists:sort(TXs), lists:sort(MinedTXs)),
 			BDS = ar_block:generate_block_data_segment(
@@ -491,15 +701,15 @@ assert_mine_output(B, POA, TXs) ->
 				POA,
 				TXs,
 				<<>>,
-				Timestamp,
+				NewB#block.timestamp,
 				[]
 			),
 			?assertEqual(
-				ar_weave:hash(BDS, Nonce, B#block.height),
-				Hash
+				ar_weave:hash(BDS, NewB#block.nonce, B#block.height),
+				NewB#block.hash
 			),
-			?assert(binary:decode_unsigned(Hash) > MinedDiff),
-			{MinedDiff, Timestamp}
+			?assert(binary:decode_unsigned(NewB#block.hash) > NewB#block.diff),
+			{NewB#block.diff, NewB#block.timestamp}
 	after 20000 ->
 		error(timeout)
 	end.
